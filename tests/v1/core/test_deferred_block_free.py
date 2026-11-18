@@ -646,3 +646,118 @@ def test_abort_deferred_async_load_frees_after_inflight_step():
         scheduler.update_from_output(output, _make_model_runner_output(output))
     assert not scheduler.deferred_frees
     assert pool.get_num_free_blocks() > num_free_held
+
+
+def _fence_all_but(scheduler, unfenced):
+    """Schedule two in-flight steps for all running requests, keeping
+    `unfenced` out of the second one, then process the first step's
+    output. Afterwards `unfenced`'s blocks can be freed immediately while
+    every other request's blocks are still fenced by the in-flight step.
+    """
+    out0 = scheduler.schedule()
+    running = list(scheduler.running)
+    skipped = [r for r in running if r is not unfenced]
+    for r in running:
+        # Keep only `unfenced` out of the next step.
+        if r is unfenced:
+            r.next_decode_eligible_step = scheduler.current_step + 2
+    out1 = scheduler.schedule()
+    assert unfenced.request_id not in out1.num_scheduled_tokens
+    for r in skipped:
+        assert r.request_id in out1.num_scheduled_tokens
+    scheduler.update_from_output(out0, _make_model_runner_output(out0))
+    assert scheduler._request_blocks_can_be_freed(unfenced)
+    for r in skipped:
+        assert not scheduler._request_blocks_can_be_freed(r)
+    return out1
+
+
+def test_preemption_scans_past_deferred_victim_fcfs():
+    """FCFS: when the youngest victim's blocks are still fenced by an
+    in-flight step, the scheduler must reclaim from the next freeable
+    victim in the same step instead of stalling the allocation.
+    """
+    scheduler = _create_deferring_scheduler("fcfs")
+    trigger, middle, tail = create_requests(
+        num_requests=3,
+        num_tokens=NUM_PROMPT_TOKENS,
+        max_tokens=10,
+        req_ids=["trigger", "middle", "tail"],
+    )
+    for request in (trigger, middle, tail):
+        scheduler.add_request(request)
+    _fence_all_but(scheduler, unfenced=middle)
+
+    # The trigger's first allocation fails; the natural FCFS victim is the
+    # tail, but its free is deferred, so `middle` must be preempted.
+    with _fail_one_allocation(scheduler, 1):
+        out = scheduler.schedule()
+    assert middle.request_id in out.preempted_req_ids
+    assert tail.request_id not in out.preempted_req_ids
+    assert trigger.request_id in out.num_scheduled_tokens
+    assert tail.request_id in out.num_scheduled_tokens
+
+
+def test_preemption_scans_past_deferred_victim_priority():
+    """Priority: when the lowest-priority victim's free is deferred, the
+    next-lowest-priority freeable victim is preempted instead."""
+    scheduler = _create_deferring_scheduler("priority")
+    trigger, freeable_mid, fenced_worst = create_requests(
+        num_requests=3,
+        num_tokens=NUM_PROMPT_TOKENS,
+        max_tokens=10,
+        req_ids=["trigger", "freeable_mid", "fenced_worst"],
+    )
+    # Higher priority value = scheduled later = preempted first.
+    trigger.priority = 0
+    freeable_mid.priority = 5
+    fenced_worst.priority = 9
+    for request in (trigger, freeable_mid, fenced_worst):
+        scheduler.add_request(request)
+    _fence_all_but(scheduler, unfenced=freeable_mid)
+
+    # The worst-priority request is fenced; the scheduler must skip it and
+    # preempt the next-worst freeable request to place the trigger.
+    with _fail_one_allocation(scheduler, 1):
+        out = scheduler.schedule()
+    assert freeable_mid.request_id in out.preempted_req_ids
+    assert fenced_worst.request_id not in out.preempted_req_ids
+    assert fenced_worst.request_id in out.num_scheduled_tokens
+    assert trigger.request_id in out.num_scheduled_tokens
+
+
+def test_preemption_never_passes_triggering_request():
+    """The victim scan must stop at the triggering request: with no
+    freeable victim below it, the request waits instead of preempting a
+    more important request or itself with a deferred free.
+    """
+    scheduler = _create_deferring_scheduler("fcfs")
+    trigger, other = create_requests(
+        num_requests=2,
+        num_tokens=NUM_PROMPT_TOKENS,
+        max_tokens=10,
+        req_ids=["trigger", "other"],
+    )
+    for request in (trigger, other):
+        scheduler.add_request(request)
+    out0 = scheduler.schedule()
+    out1 = scheduler.schedule()
+    # Both requests have in-flight steps: no victim is freeable.
+    assert not scheduler._request_blocks_can_be_freed(trigger)
+    assert not scheduler._request_blocks_can_be_freed(other)
+
+    with _fail_one_allocation(scheduler, 1) as allocate:
+        blocked = scheduler.schedule()
+    assert allocate.call_count == 1
+    assert not blocked.preempted_req_ids
+    assert trigger.request_id not in blocked.num_scheduled_tokens
+    assert trigger in scheduler.running
+
+    # Once the in-flight outputs are processed, the retry preempts the
+    # tail and the trigger is placed.
+    scheduler.update_from_output(out0, _make_model_runner_output(out0))
+    scheduler.update_from_output(out1, _make_model_runner_output(out1))
+    with _fail_one_allocation(scheduler, 1):
+        resumed = scheduler.schedule()
+    assert other.request_id in resumed.preempted_req_ids
+    assert trigger.request_id in resumed.num_scheduled_tokens

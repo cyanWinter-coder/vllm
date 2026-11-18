@@ -905,50 +905,43 @@ class Scheduler(SchedulerInterface):
                         break
 
                     # The request cannot be scheduled.
-                    # Preempt the lowest-priority request.
-                    if self.policy == SchedulingPolicy.PRIORITY:
-                        preempted_req = max(
-                            self.running,
-                            key=lambda r: (r.priority, r.arrival_time),
-                        )
-                    else:
-                        preempted_req = self.running[-1]
+                    # Preempt the lowest-priority request whose blocks can
+                    # be freed immediately.
+                    preempted_req = self._select_preemption_victim(request, req_index)
 
-                    # A deferred free will not help with immediate allocation.
-                    if not self._request_blocks_can_be_freed(preempted_req):
+                    # No freeable victim: a deferred free will not help
+                    # with immediate allocation, so retry on a later step.
+                    if preempted_req is None:
                         break
 
-                    if self.policy == SchedulingPolicy.PRIORITY:
-                        victim_index = self.running.index(preempted_req)
-                        del self.running[victim_index]
-                        if victim_index < req_index:
-                            req_index -= 1
+                    victim_index = self.running.index(preempted_req)
+                    del self.running[victim_index]
+                    if victim_index < req_index:
+                        req_index -= 1
 
-                        if preempted_req in scheduled_running_reqs:
-                            preempted_req_id = preempted_req.request_id
-                            scheduled_running_reqs.remove(preempted_req)
-                            restored = num_scheduled_tokens.pop(preempted_req_id)
-                            token_budget += restored
-                            input_budget += restored + draft_slots
-                            req_to_new_blocks.pop(preempted_req_id)
-                            scheduled_spec_decode_tokens.pop(preempted_req_id, None)
-                            preempted_encoder_inputs = scheduled_encoder_inputs.pop(
-                                preempted_req_id, None
+                    if preempted_req in scheduled_running_reqs:
+                        preempted_req_id = preempted_req.request_id
+                        scheduled_running_reqs.remove(preempted_req)
+                        restored = num_scheduled_tokens.pop(preempted_req_id)
+                        token_budget += restored
+                        input_budget += restored + draft_slots
+                        req_to_new_blocks.pop(preempted_req_id)
+                        scheduled_spec_decode_tokens.pop(preempted_req_id, None)
+                        preempted_encoder_inputs = scheduled_encoder_inputs.pop(
+                            preempted_req_id, None
+                        )
+                        if preempted_encoder_inputs:
+                            # Restore encoder compute budget if the preempted
+                            # request had encoder inputs scheduled in this step.
+                            num_embeds_to_restore = sum(
+                                preempted_req.get_num_encoder_embeds(i)
+                                for i in preempted_encoder_inputs
                             )
-                            if preempted_encoder_inputs:
-                                # Restore encoder compute budget if the preempted
-                                # request had encoder inputs scheduled in this step.
-                                num_embeds_to_restore = sum(
-                                    preempted_req.get_num_encoder_embeds(i)
-                                    for i in preempted_encoder_inputs
+                            encoder_compute_budget += num_embeds_to_restore
+                            if iteration_details is not None:
+                                num_scheduled_encoder_inputs -= len(
+                                    preempted_encoder_inputs
                                 )
-                                encoder_compute_budget += num_embeds_to_restore
-                                if iteration_details is not None:
-                                    num_scheduled_encoder_inputs -= len(
-                                        preempted_encoder_inputs
-                                    )
-                    else:
-                        preempted_req = self.running.pop()
 
                     self._preempt_request(
                         preempted_req,
@@ -3177,6 +3170,47 @@ class Scheduler(SchedulerInterface):
         return not self.defer_block_free or (
             request.last_sched_seq <= self.processed_step_seq
         )
+
+    def _select_preemption_victim(
+        self, request: Request, req_index: int
+    ) -> Request | None:
+        """Select the lowest-priority running request whose blocks can be
+        freed immediately, scanning past victims whose frees are deferred.
+
+        With deferred block freeing (async KV delivery), the natural
+        victim's blocks may still be written by an in-flight GPU step.
+        Reclaiming from the next-best freeable victim in the same step
+        keeps the triggering request from stalling behind the fence; the
+        freed blocks are equivalent to the allocator, so reclaim now
+        rather than retrying the whole allocation on a later step.
+
+        The scan never passes `request` itself: preempting a more
+        important request to make room for a less important one would
+        invert the scheduling policy.
+
+        Returns None when no freeable victim exists; the caller then
+        leaves the request unscheduled and retries on a later step.
+        """
+        if self.policy == SchedulingPolicy.PRIORITY:
+            # Worst (highest priority value, latest arrival) first.
+            candidates = sorted(
+                self.running,
+                key=lambda r: (r.priority, r.arrival_time),
+                reverse=True,
+            )
+        else:
+            # FCFS: youngest first, from the tail of the running list down
+            # to (and including) the request being scheduled.
+            candidates = self.running[req_index:][::-1]
+
+        for candidate in candidates:
+            if self._request_blocks_can_be_freed(candidate):
+                return candidate
+            if candidate is request:
+                # The request's own free is deferred, and it cannot
+                # preempt anything more important than itself.
+                return None
+        return None
 
     def _free_request_blocks(self, request: Request):
         """Free the request's KV blocks, deferring the return to the block

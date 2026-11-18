@@ -199,6 +199,20 @@ When a request is finished, we free all its blocks if no other requests are usin
 
 ![Free queue after a request is freed](../assets/design/prefix_caching/free.png)
 
+### Deferred Free
+
+With overlapping batches (async scheduling or pipeline parallelism) and an
+asynchronous KV connector, a finished or preempted request's blocks may still
+be written by an in-flight GPU step. The scheduler then pops the request's
+blocks from its bookkeeping immediately — so the request can be rescheduled
+or its slot reused — but defers returning the blocks to the free queue until
+the in-flight step's output has been processed. Blocks withheld this way are
+invisible to `allocate_slots()`, so an allocation that would preempt a victim
+whose free is still deferred cannot make progress on it; the scheduler
+instead reclaims from the next-lowest-priority request whose blocks can be
+freed immediately. See [Preemption](arch_overview.md#preemption) for the
+victim-selection rules.
+
 ### Eviction (LRU)
 
 When the head block (least recently used block) of the free queue is cached, we have to evict the block to prevent it from being used by other requests. Specifically, eviction involves the following steps:

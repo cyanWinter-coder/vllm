@@ -2467,6 +2467,75 @@ def test_preempt_during_execution():
     assert requests[1].output_token_ids[0] == 42
 
 
+def test_long_prefill_batch_decode_preemption_block_accounting():
+    """Long chunked prefills interleaved with batch decode and preemption
+    must conserve KV blocks.
+
+    Drives a small block pool with a mix of long requests (forced into
+    prefill chunks) and short decode requests until all of them finish,
+    asserting at every step that blocks are neither leaked nor freed
+    twice, that preemption actually happens, and that preempted requests
+    recover and produce their full output.
+    """
+    block_size = 16
+    num_blocks = 40  # 39 usable; total demand below exceeds the pool.
+    scheduler = create_scheduler(
+        max_num_batched_tokens=64,
+        long_prefill_token_threshold=16,
+        block_size=block_size,
+        num_blocks=num_blocks,
+        enable_prefix_caching=False,
+        max_num_seqs=8,
+    )
+    pool = scheduler.kv_cache_manager.block_pool
+    num_free_initially = pool.get_num_free_blocks()
+
+    long_reqs = create_requests(
+        num_requests=2,
+        num_tokens=200,
+        max_tokens=10,
+        block_size=block_size,
+        req_ids=["long0", "long1"],
+    )
+    short_reqs = create_requests(
+        num_requests=5,
+        num_tokens=48,
+        max_tokens=10,
+        block_size=block_size,
+        req_ids=[f"short{i}" for i in range(5)],
+    )
+    requests = long_reqs + short_reqs
+    for request in requests:
+        scheduler.add_request(request)
+
+    num_preemptions = 0
+    while scheduler.get_num_unfinished_requests() > 0:
+        scheduler_output = scheduler.schedule()
+        # Blocks are never freed twice (free count stays within the pool).
+        assert 0 <= pool.get_num_free_blocks() <= num_free_initially
+        num_preemptions += len(scheduler_output.preempted_req_ids)
+        if not scheduler_output.num_scheduled_tokens:
+            # No request made progress this step; the loop must not stall.
+            break
+        model_runner_output = ModelRunnerOutput(
+            req_ids=list(scheduler_output.num_scheduled_tokens),
+            sampled_token_ids=[[0] for _ in scheduler_output.num_scheduled_tokens],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        )
+        scheduler.update_from_output(scheduler_output, model_runner_output)
+
+    # The pool is too small to hold every request at once: preemption
+    # must have occurred, and every request must have recovered from it.
+    assert num_preemptions > 0
+    assert scheduler.get_num_unfinished_requests() == 0
+    for request in requests:
+        assert len(request.output_token_ids) == request.max_tokens
+    # No leak: every block returns to the pool once all requests finish.
+    assert pool.get_num_free_blocks() == num_free_initially
+
+
 def test_pending_hisparse_reclamation_defers_preemption(monkeypatch):
     """Pending reclamation must stall rather than preempt its owning request."""
     scheduler = create_scheduler(enable_prefix_caching=False)

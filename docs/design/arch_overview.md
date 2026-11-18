@@ -167,6 +167,19 @@ blocks are free:
     memory. Prefix caching or a KV connector can restore part of its progress
     immediately.
 
+All block reclamation is decided inside the scheduler's allocation loop; the
+engine never retries a failed allocation on the scheduler's behalf. When
+batches overlap (async scheduling or pipeline parallelism) and a KV connector
+delivers KV asynchronously, a victim's blocks may still be written by an
+in-flight GPU step, so returning them to the pool is **deferred** until that
+step's output has been processed. A victim whose free is deferred cannot help
+the current allocation, so the scheduler scans past it and preempts the
+next-lowest-priority request whose blocks can be freed immediately —
+reclaiming within the same step instead of stalling the allocation behind the
+fence. The scan never passes the triggering request itself, so a request can
+only evict requests no more important than itself. If no such victim exists,
+the request simply stays unscheduled and is retried on a later step.
+
 For how to reduce preemption, see
 [Preemption](../configuration/optimization.md#preemption).
 
